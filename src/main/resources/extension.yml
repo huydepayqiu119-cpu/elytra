@@ -1,0 +1,6 @@
+id: campfire-elytra
+name: CampfireElytra
+version: 1.0.0
+authors: [ campfire ]
+main: com.campfire.elytra.ElytraExtension
+description: Forces elytra gliding animation for custom elytra on Bedrock players
