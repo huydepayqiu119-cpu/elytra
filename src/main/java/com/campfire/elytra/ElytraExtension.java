@@ -56,40 +56,32 @@ public class ElytraExtension implements Extension {
     //    opens the wings on custom elytra attachable
     // ------------------------------------------------------------------
     private void tickGlide(GeyserConnection connection) throws Exception {
-        // GeyserConnection is GeyserSession at runtime
         Object session = connection;
 
-        // getPlayerEntity()
         Object playerEntity = invokeMethod(session, "getPlayerEntity");
         if (playerEntity == null) return;
 
-        // getFlags() -> EntityFlags
         Object flags = invokeMethod(playerEntity, "getFlags");
         if (flags == null) return;
 
-        // Check IS_GLIDING flag current value
         Class<?> entityFlagClass = Class.forName(
             "org.cloudburstmc.protocol.bedrock.data.entity.EntityFlag");
         Object isGlidingFlag = getEnumConstant(entityFlagClass, "IS_GLIDING");
         if (isGlidingFlag == null) return;
 
-        // getFlag(EntityFlag) -> boolean
         boolean isGliding = (boolean) invokeMethod(flags, "getFlag", entityFlagClass, isGlidingFlag);
         if (!isGliding) return;
 
-        // Player is gliding — build and send SetEntityDataPacket
-        // getGeyserId() -> long  (Bedrock runtime entity ID)
-        long runtimeId = (long) invokeMethod(playerEntity, "getGeyserId");
+        // Check chestplate material is elytra
+        if (!isWearingElytra(session)) return;
 
-        // getDirtyMetadata() — entity metadata container to send
+        long runtimeId = (long) invokeMethod(playerEntity, "getGeyserId");
         Object dirtyMetadata = invokeMethod(playerEntity, "getDirtyMetadata");
         if (dirtyMetadata == null) return;
 
-        // Ensure IS_GLIDING is set true in the dirty metadata
         invokeMethod(flags, "setFlag", entityFlagClass, boolean.class,
             isGlidingFlag, true);
 
-        // Build SetEntityDataPacket
         Class<?> packetClass = Class.forName(
             "org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket");
         Object packet = packetClass.getDeclaredConstructor().newInstance();
@@ -98,10 +90,41 @@ public class ElytraExtension implements Extension {
         setField(packet, "metadata", dirtyMetadata);
         setField(packet, "tick", 0L);
 
-        // sendUpstreamPacket(BedrockPacket)
         invokeMethod(session, "sendUpstreamPacket",
             Class.forName("org.cloudburstmc.protocol.bedrock.packet.BedrockPacket"),
             packet);
+    }
+
+    // ------------------------------------------------------------------
+    // Check chestplate item type == elytra via Geyser inventory cache
+    // GeyserItemStack has getJavaId() which maps to Java item registry
+    // We just check the identifier string contains "elytra"
+    // ------------------------------------------------------------------
+    private boolean isWearingElytra(Object session) {
+        try {
+            Object inventory = invokeMethod(session, "getPlayerInventory");
+            if (inventory == null) return false;
+
+            Object chestplate = invokeMethod(inventory, "getChestplate");
+            if (chestplate == null) return false;
+
+            // GeyserItemStack.getMapping(session) -> ItemMapping
+            Object mapping = invokeMethod(chestplate, "getMapping", session.getClass(), session);
+            if (mapping == null) {
+                // fallback: try getJavaIdentifier() directly on item stack
+                Object identifier = invokeMethod(chestplate, "getJavaIdentifier");
+                if (identifier == null) return false;
+                return identifier.toString().contains("elytra");
+            }
+
+            // ItemMapping.getJavaIdentifier() -> "minecraft:elytra"
+            Object identifier = invokeMethod(mapping, "getJavaIdentifier");
+            if (identifier == null) return false;
+            return identifier.toString().contains("elytra");
+
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     // ------------------------------------------------------------------
