@@ -1,5 +1,6 @@
 id: campfire-elytra
 name: CampfireElytra
 version: 1.0.0
-authors: [ campfire ]
+api: 2.10.0-SNAPSHOT
+authors: [ Kaito ]
 main: com.campfire.elytra.ElytraExtension
