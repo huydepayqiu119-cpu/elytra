@@ -24,6 +24,9 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      - name: Generate Gradle wrapper jar
+        run: gradle wrapper --gradle-version 8.10
+
       - name: Build
         run: ./gradlew shadowJar
 
