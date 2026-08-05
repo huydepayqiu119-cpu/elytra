@@ -1,0 +1,6 @@
+name: ElytraPlugin
+version: 1.0.0
+main: com.campfire.elytra.ElytraPlugin
+api-version: '1.21'
+depend: [Geyser-Spigot]
+description: Custom elytra animation fix for Bedrock players via Geyser
