@@ -30,7 +30,7 @@ public class ElytraExtension implements Extension {
     @Subscribe
     public void onSessionJoin(SessionJoinEvent event) {
         GeyserConnection connection = event.connection();
-        UUID uuid = connection.uuid();
+        UUID uuid = connection.playerUuid();
 
         // Poll every 500ms — check if player is gliding, if yes force the animation
         ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(() -> {
@@ -44,7 +44,7 @@ public class ElytraExtension implements Extension {
 
     @Subscribe
     public void onSessionDisconnect(SessionDisconnectEvent event) {
-        ScheduledFuture<?> task = tasks.remove(event.connection().uuid());
+        ScheduledFuture<?> task = tasks.remove(event.connection().playerUuid());
         if (task != null) task.cancel(false);
     }
 
