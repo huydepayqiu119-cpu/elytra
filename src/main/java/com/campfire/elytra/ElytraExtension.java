@@ -7,6 +7,7 @@ import org.geysermc.geyser.api.event.bedrock.SessionJoinEvent;
 import org.geysermc.geyser.api.event.lifecycle.GeyserPostInitializeEvent;
 import org.geysermc.geyser.api.extension.Extension;
 
+import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -75,22 +76,66 @@ public class ElytraExtension implements Extension {
             Class.forName("org.cloudburstmc.protocol.bedrock.packet.BedrockPacket"), packet);
     }
 
+    /**
+     * Check if the player is wearing any item that behaves as an elytra.
+     * This covers vanilla minecraft:elytra AND any custom item mapped to elytra via Geyser mappings,
+     * by checking all available identifiers on both the item and its mapping.
+     */
     private boolean isWearingElytra(Object session) {
         try {
             Object inventory = invokeMethod(session, "getPlayerInventory");
             if (inventory == null) return false;
             Object chestplate = invokeMethod(inventory, "getChestplate");
             if (chestplate == null) return false;
-            Object mapping = invokeMethod(chestplate, "getMapping", session.getClass(), session);
-            if (mapping == null) {
-                Object identifier = invokeMethod(chestplate, "getJavaIdentifier");
-                return identifier != null && identifier.toString().contains("elytra");
-            }
-            Object identifier = invokeMethod(mapping, "getJavaIdentifier");
-            return identifier != null && identifier.toString().contains("elytra");
+
+            // Try every identifier-like method on the item itself
+            if (containsElytra(chestplate)) return true;
+
+            // Try via Geyser ItemMapping (custom items registered via mappings)
+            Object mapping = getMapping(chestplate, session);
+            if (mapping != null && containsElytra(mapping)) return true;
+
+            return false;
         } catch (Exception e) {
             return false;
         }
+    }
+
+    /**
+     * Try all known identifier getter method names on an object and check if any contains "elytra".
+     */
+    private boolean containsElytra(Object obj) {
+        String[] getters = {
+            "getJavaIdentifier",
+            "getBedrockIdentifier",
+            "getJavaId",
+            "getBedrockId",
+            "identifier",
+            "getId"
+        };
+        for (String getter : getters) {
+            try {
+                Object result = invokeMethod(obj, getter);
+                if (result != null && result.toString().contains("elytra")) return true;
+            } catch (Exception ignored) {}
+        }
+        return false;
+    }
+
+    /**
+     * Attempt to get the ItemMapping from a GeyserItemStack using the session as context.
+     */
+    private Object getMapping(Object chestplate, Object session) {
+        try {
+            // Try with session parameter (some Geyser versions)
+            Object mapping = invokeMethod(chestplate, "getMapping", session.getClass(), session);
+            if (mapping != null) return mapping;
+        } catch (Exception ignored) {}
+        try {
+            // Try without parameter
+            return invokeMethod(chestplate, "getMapping");
+        } catch (Exception ignored) {}
+        return null;
     }
 
     private Object invokeMethod(Object target, String name, Object... args) throws Exception {
@@ -101,7 +146,7 @@ public class ElytraExtension implements Extension {
         }
         Class<?> clazz = target.getClass();
         while (clazz != null) {
-            for (var m : clazz.getDeclaredMethods()) {
+            for (Method m : clazz.getDeclaredMethods()) {
                 if (m.getName().equals(name) && (args.length == 0 || m.getParameterCount() == args.length)) {
                     m.setAccessible(true);
                     return m.invoke(target, args);
@@ -116,7 +161,7 @@ public class ElytraExtension implements Extension {
         Class<?> clazz = target.getClass();
         while (clazz != null) {
             try {
-                var m = clazz.getDeclaredMethod(name, types);
+                Method m = clazz.getDeclaredMethod(name, types);
                 m.setAccessible(true);
                 return m.invoke(target, args);
             } catch (NoSuchMethodException ignored) {}
