@@ -19,271 +19,290 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Trick: Geyser chỉ set IS_GLIDING cho minecraft:elytra vanilla.
- * Với custom item, ta tự poll trạng thái elytra từ Java side (EntityMetadata / isFlyingWithElytra)
- * rồi inject IS_GLIDING=true qua SetEntityDataPacket xuống Bedrock client.
+ * Trick: Giống hệt Bedrock Script approach — swap chestplate thật.
  *
- * Flow:
- *  1. Mỗi 100ms, lấy playerEntity từ session
- *  2. Đọc Java-side flag "isFlyingWithElytra" từ metadata hoặc entity flags
- *  3. Nếu đang bay AND mặc custom elytra → inject IS_GLIDING packet
- *  4. Nếu không → inject IS_GLIDING=false để tắt glide animation
+ * Khi player rời mặt đất và đang mặc custom elytra:
+ *   → Geyser gửi packet thay chestplate thành minecraft:elytra thật về Bedrock client
+ *   → Client thấy elytra thật → glide bình thường, animation đúng
+ *
+ * Khi player chạm đất:
+ *   → Swap ngược lại custom item
+ *
+ * Không cần động vào Java server inventory — chỉ thao tác phía Bedrock upstream.
  */
 public class ElytraExtension implements Extension {
 
-    // Các Java identifier được coi là custom elytra (thêm vào đây nếu cần)
+    // Các custom elytra identifier (Java item id)
+    // Item chứa "elytra" trong tên (trừ minecraft:elytra) sẽ tự động được nhận
     private static final Set<String> CUSTOM_ELYTRA_IDS = Set.of(
-        "campfire:elytra",
-        "campfire:custom_elytra"
-        // thêm identifier custom item của bạn ở đây
+        "campfire:custom_elytra",
+        "campfire:elytra"
+        // thêm identifier của bạn ở đây nếu cần
     );
 
+    // State per player
+    private static class PlayerState {
+        boolean elytraActive = false;      // đang hiển thị elytra thật về phía Bedrock
+        String  savedCustomId = null;      // identifier custom item đã lưu
+        boolean wasAirborne   = false;     // frame trước có trên không không
+    }
+
+    private final Map<UUID, PlayerState>    states    = new ConcurrentHashMap<>();
     private final Map<UUID, ScheduledFuture<?>> tasks = new ConcurrentHashMap<>();
-    // track trạng thái glide trước đó để chỉ gửi packet khi thay đổi
-    private final Map<UUID, Boolean> lastGlideState = new ConcurrentHashMap<>();
     private ScheduledExecutorService scheduler;
 
     @Subscribe
     public void onPostInitialize(GeyserPostInitializeEvent event) {
         scheduler = Executors.newScheduledThreadPool(4);
-        this.logger().info("CampfireElytra enabled.");
+        logger().info("CampfireElytra enabled.");
     }
 
     @Subscribe
     public void onSessionJoin(SessionJoinEvent event) {
-        GeyserConnection connection = event.connection();
-        UUID uuid = connection.playerUuid();
+        GeyserConnection conn = event.connection();
+        UUID uuid = conn.playerUuid();
+        states.put(uuid, new PlayerState());
         ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(() -> {
-            try {
-                tickCustomElytra(connection);
-            } catch (Exception e) {
-                // silent fail — session có thể đang disconnect
-            }
-        }, 200, 100, TimeUnit.MILLISECONDS);
+            try { tick(conn); } catch (Exception ignored) {}
+        }, 300, 100, TimeUnit.MILLISECONDS);
         tasks.put(uuid, task);
-        lastGlideState.put(uuid, false);
     }
 
     @Subscribe
     public void onSessionDisconnect(SessionDisconnectEvent event) {
         UUID uuid = event.connection().playerUuid();
-        ScheduledFuture<?> task = tasks.remove(uuid);
-        if (task != null) task.cancel(false);
-        lastGlideState.remove(uuid);
+        ScheduledFuture<?> t = tasks.remove(uuid);
+        if (t != null) t.cancel(false);
+        states.remove(uuid);
     }
 
-    private void tickCustomElytra(GeyserConnection connection) throws Exception {
+    // ── Core tick ────────────────────────────────────────────────────────────
+
+    private void tick(GeyserConnection connection) throws Exception {
         Object session = connection;
-
-        // 1. Kiểm tra player đang mặc custom elytra không
-        if (!isWearingCustomElytra(session)) {
-            // nếu không, đảm bảo glide state tắt
-            forceGlideState(session, false);
-            return;
-        }
-
-        // 2. Đọc trạng thái "đang bay elytra" từ Java entity metadata
-        boolean isFlyingWithElytra = readJavaGlidingFlag(session);
-
-        // 3. Chỉ gửi packet nếu state thay đổi
         UUID uuid = connection.playerUuid();
-        boolean last = lastGlideState.getOrDefault(uuid, false);
-        if (isFlyingWithElytra != last) {
-            lastGlideState.put(uuid, isFlyingWithElytra);
-            forceGlideState(session, isFlyingWithElytra);
+        PlayerState state = states.get(uuid);
+        if (state == null) return;
+
+        // Lấy inventory Bedrock-side (GeyserItemStack)
+        Object inventory = invokeNoArgs(session, "getPlayerInventory");
+        if (inventory == null) return;
+
+        Object chestItem = invokeNoArgs(inventory, "getChestplate");
+
+        // Kiểm tra player có đang trên không không
+        boolean airborne = isAirborne(session);
+
+        if (!state.elytraActive) {
+            // --- Chưa swap: kiểm tra xem có nên swap sang elytra không ---
+            if (chestItem == null) return;
+            String customId = getJavaId(chestItem);
+            if (!isCustomElytra(customId)) return;
+
+            if (airborne) {
+                // Swap: ghi nhớ custom item rồi gửi elytra về phía Bedrock
+                state.savedCustomId  = customId;
+                state.elytraActive   = true;
+                sendChestplatePacket(session, "minecraft:elytra");
+            }
+        } else {
+            // --- Đang swap: kiểm tra có nên swap ngược lại không ---
+            if (!airborne && state.wasAirborne) {
+                // Vừa chạm đất → swap lại
+                state.elytraActive = false;
+                String restoreId = state.savedCustomId != null ? state.savedCustomId : "minecraft:elytra";
+                sendChestplatePacket(session, restoreId);
+                state.savedCustomId = null;
+            }
         }
+
+        state.wasAirborne = airborne;
     }
+
+    // ── Gửi packet đổi chestplate về Bedrock client ──────────────────────────
 
     /**
-     * Đọc cờ "đang lướt elytra" từ Java entity data.
-     * Geyser lưu các flag Java trong playerEntity dưới dạng EntityMetadata.
-     * Flag index 7 bit 7 = isFlyingWithElytra theo Java protocol.
+     * Gửi MobEquipmentPacket / InventorySlotPacket về phía Bedrock để client
+     * thấy chestplate thay đổi mà không thật sự thay đổi Java inventory.
      */
-    private boolean readJavaGlidingFlag(Object session) {
+    private void sendChestplatePacket(Object session, String itemId) {
         try {
-            Object playerEntity = getField(session, "playerEntity");
-            if (playerEntity == null) playerEntity = invokeNoArgs(session, "getPlayerEntity");
+            // Lấy ItemMapping cho itemId từ ItemMappings của session
+            Object itemMappings = getItemMappings(session);
+            if (itemMappings == null) return;
+
+            Object bedrockData = resolveBedrockItem(itemMappings, itemId);
+            if (bedrockData == null) return;
+
+            // Build InventorySlotPacket (slot 6 = chestplate trong Bedrock inventory)
+            Class<?> packetClass = Class.forName(
+                "org.cloudburstmc.protocol.bedrock.packet.InventorySlotPacket");
+            Object packet = packetClass.getDeclaredConstructor().newInstance();
+
+            // containerId = 0 (player inventory), slot 6 = chestplate
+            setField(packet, "containerId", 0);
+            setField(packet, "slot", 6);
+            setField(packet, "item", bedrockData);
+
+            Class<?> bedrockPacketClass = Class.forName(
+                "org.cloudburstmc.protocol.bedrock.packet.BedrockPacket");
+            invokeTyped(session, "sendUpstreamPacket",
+                new Class[]{bedrockPacketClass}, packet);
+
+        } catch (Exception e) {
+            // Fallback: thử MobEquipmentPacket
+            try { sendMobEquipmentPacket(session, itemId); } catch (Exception ignored) {}
+        }
+    }
+
+    private void sendMobEquipmentPacket(Object session, String itemId) throws Exception {
+        Object itemMappings = getItemMappings(session);
+        if (itemMappings == null) return;
+
+        Object bedrockData = resolveBedrockItem(itemMappings, itemId);
+        if (bedrockData == null) return;
+
+        Object playerEntity = invokeNoArgs(session, "getPlayerEntity");
+        if (playerEntity == null) return;
+        long runtimeId = ((Number) invokeNoArgs(playerEntity, "getGeyserId")).longValue();
+
+        Class<?> packetClass = Class.forName(
+            "org.cloudburstmc.protocol.bedrock.packet.MobEquipmentPacket");
+        Object packet = packetClass.getDeclaredConstructor().newInstance();
+        setField(packet, "runtimeEntityId", runtimeId);
+        setField(packet, "item", bedrockData);
+        setField(packet, "inventorySlot", 6);
+        setField(packet, "hotbarSlot", 0);
+        setField(packet, "containerId", (byte) 6); // ARMOR container
+
+        Class<?> bedrockPacketClass = Class.forName(
+            "org.cloudburstmc.protocol.bedrock.packet.BedrockPacket");
+        invokeTyped(session, "sendUpstreamPacket",
+            new Class[]{bedrockPacketClass}, packet);
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private boolean isAirborne(Object session) {
+        try {
+            // Thử đọc onGround flag từ playerEntity
+            Object playerEntity = invokeNoArgs(session, "getPlayerEntity");
             if (playerEntity == null) return false;
 
-            // Thử đọc trực tiếp field "flying" hoặc "elytraFlying" từ entity
-            for (String fieldName : new String[]{"elytraFlying", "flyingWithElytra", "gliding"}) {
+            for (String f : new String[]{"onGround", "isOnGround"}) {
                 try {
-                    Object val = getField(playerEntity, fieldName);
-                    if (val instanceof Boolean b) return b;
+                    Object val = getField(playerEntity, f);
+                    if (val instanceof Boolean b) return !b;
+                } catch (Exception ignored) {}
+                try {
+                    Object val = invokeNoArgs(playerEntity, f);
+                    if (val instanceof Boolean b) return !b;
                 } catch (Exception ignored) {}
             }
 
-            // Thử qua Java metadata: EntityMetadata list, tìm index 7 (shared flags)
-            Object metadata = invokeNoArgs(playerEntity, "getMetadata");
-            if (metadata == null) metadata = getField(playerEntity, "metadata");
-            if (metadata != null) {
-                // metadata thường là Map<Integer, EntityMetadata>
-                if (metadata instanceof Map<?, ?> map) {
-                    Object entry = map.get(7); // index 7 = shared flags byte
-                    if (entry != null) {
-                        Object value = invokeNoArgs(entry, "getValue");
-                        if (value instanceof Number n) {
-                            int flags = n.intValue();
-                            return (flags & (1 << 7)) != 0; // bit 7 = isFlyingWithElytra
-                        }
+            // Fallback: đọc qua Geyser connection API
+            Object onGround = invokeNoArgs(session, "isOnGround");
+            if (onGround instanceof Boolean b) return !b;
+
+            return false;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private Object getItemMappings(Object session) {
+        for (String m : new String[]{"getItemMappings", "getMappings", "getCodecHelper"}) {
+            try {
+                Object r = invokeNoArgs(session, m);
+                if (r != null) return r;
+            } catch (Exception ignored) {}
+        }
+        try {
+            // Thử qua upstream session
+            Object upstream = getField(session, "upstream");
+            if (upstream != null) return invokeNoArgs(upstream, "getItemDefinitions");
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    /**
+     * Resolve Bedrock ItemData từ Java identifier.
+     * Trả về ItemData object để nhét vào packet.
+     */
+    private Object resolveBedrockItem(Object itemMappings, String javaId) {
+        try {
+            // Thử getMapping(String) trực tiếp
+            for (String m : new String[]{"getMapping", "getItemMapping", "getMappingByJavaIdentifier"}) {
+                try {
+                    Object mapping = invokeTyped(itemMappings, m,
+                        new Class[]{String.class}, javaId);
+                    if (mapping != null) {
+                        // Convert mapping → ItemData
+                        return mappingToItemData(mapping);
                     }
+                } catch (Exception ignored) {}
+            }
+
+            // Thử duyệt mappings list
+            Object mappingsList = invokeNoArgs(itemMappings, "getItems");
+            if (mappingsList instanceof Iterable<?> it) {
+                for (Object entry : it) {
+                    try {
+                        Object id = invokeNoArgs(entry, "getJavaIdentifier");
+                        if (id != null && id.toString().equals(javaId)) {
+                            return mappingToItemData(entry);
+                        }
+                    } catch (Exception ignored) {}
                 }
             }
-
-            // Fallback: đọc Bedrock IS_GLIDING (nếu Geyser đã propagate)
-            return readBedrockGlidingFlag(playerEntity);
-
-        } catch (Exception e) {
-            return false;
-        }
+        } catch (Exception ignored) {}
+        return null;
     }
 
-    /**
-     * Fallback: đọc IS_GLIDING từ Bedrock entity flags.
-     */
-    private boolean readBedrockGlidingFlag(Object playerEntity) {
+    private Object mappingToItemData(Object mapping) throws Exception {
+        // Thử getItemData() trực tiếp
         try {
-            Object flags = invokeNoArgs(playerEntity, "getFlags");
-            if (flags == null) return false;
-            Class<?> flagClass = Class.forName("org.cloudburstmc.protocol.bedrock.data.entity.EntityFlag");
-            Object isGlidingConst = getEnumConstant(flagClass, "IS_GLIDING");
-            if (isGlidingConst == null) return false;
-            Object result = invokeTyped(flags, "getFlag", new Class[]{flagClass}, isGlidingConst);
-            return result instanceof Boolean b && b;
-        } catch (Exception e) {
-            return false;
-        }
+            Object data = invokeNoArgs(mapping, "getItemData");
+            if (data != null) return data;
+        } catch (Exception ignored) {}
+
+        // Build ItemData từ bedrockId + bedrockData
+        Object bedrockIdObj = invokeNoArgs(mapping, "getBedrockId");
+        if (bedrockIdObj == null) return null;
+        int bedrockId = ((Number) bedrockIdObj).intValue();
+
+        Class<?> itemDataClass = Class.forName("org.cloudburstmc.protocol.bedrock.data.inventory.ItemData");
+        // ItemData.builder().id(x).count(1).build()
+        Object builder = itemDataClass.getMethod("builder").invoke(null);
+        invokeTyped(builder, "id", new Class[]{int.class}, bedrockId);
+        invokeTyped(builder, "count", new Class[]{int.class}, 1);
+        return invokeNoArgs(builder, "build");
     }
 
-    /**
-     * Inject IS_GLIDING = state vào Bedrock client bằng SetEntityDataPacket.
-     */
-    private void forceGlideState(Object session, boolean state) {
-        try {
-            Object playerEntity = getField(session, "playerEntity");
-            if (playerEntity == null) playerEntity = invokeNoArgs(session, "getPlayerEntity");
-            if (playerEntity == null) return;
-
-            Object flags = invokeNoArgs(playerEntity, "getFlags");
-            if (flags == null) return;
-
-            Class<?> flagClass = Class.forName("org.cloudburstmc.protocol.bedrock.data.entity.EntityFlag");
-            Object isGlidingConst = getEnumConstant(flagClass, "IS_GLIDING");
-            if (isGlidingConst == null) return;
-
-            // Set flag trên entity
-            invokeTyped(flags, "setFlag", new Class[]{flagClass, boolean.class}, isGlidingConst, state);
-
-            // Lấy runtimeId
-            Object runtimeIdObj = invokeNoArgs(playerEntity, "getGeyserId");
-            if (runtimeIdObj == null) return;
-            long runtimeId = ((Number) runtimeIdObj).longValue();
-
-            // Lấy dirty metadata — thử nhiều tên khác nhau
-            Object dirtyMetadata = null;
-            for (String m : new String[]{"getDirtyMetadata", "getMetadata", "dirtyMetadata"}) {
-                try {
-                    dirtyMetadata = invokeNoArgs(playerEntity, m);
-                    if (dirtyMetadata == null) dirtyMetadata = getField(playerEntity, m.replace("get", "").toLowerCase());
-                    if (dirtyMetadata != null) break;
-                } catch (Exception ignored) {}
-            }
-            if (dirtyMetadata == null) return;
-
-            // Build SetEntityDataPacket
-            Class<?> packetClass = Class.forName("org.cloudburstmc.protocol.bedrock.packet.SetEntityDataPacket");
-            Object packet = packetClass.getDeclaredConstructor().newInstance();
-            setField(packet, "runtimeEntityId", runtimeId);
-            setField(packet, "metadata", dirtyMetadata);
-            setField(packet, "tick", 0L);
-
-            // Gửi upstream (Geyser → Bedrock client)
-            Class<?> bedrockPacketClass = Class.forName("org.cloudburstmc.protocol.bedrock.packet.BedrockPacket");
-            invokeTyped(session, "sendUpstreamPacket", new Class[]{bedrockPacketClass}, packet);
-
-        } catch (Exception e) {
-            // silent fail
-        }
+    private boolean isCustomElytra(String id) {
+        if (id == null) return false;
+        if (CUSTOM_ELYTRA_IDS.contains(id)) return true;
+        return id.contains("elytra") && !id.equals("minecraft:elytra");
     }
 
-    /**
-     * Kiểm tra chestplate có phải custom elytra không.
-     * Chỉ check các identifier trong CUSTOM_ELYTRA_IDS — vanilla minecraft:elytra bị bỏ qua.
-     */
-    private boolean isWearingCustomElytra(Object session) {
-        try {
-            Object inventory = invokeNoArgs(session, "getPlayerInventory");
-            if (inventory == null) return false;
-
-            Object chestplate = invokeNoArgs(inventory, "getChestplate");
-            if (chestplate == null) return false;
-
-            // Lấy Java identifier của item
-            String javaId = getJavaItemId(chestplate, session);
-            if (javaId == null) return false;
-
-            return CUSTOM_ELYTRA_IDS.contains(javaId)
-                || (javaId.contains("elytra") && !javaId.equals("minecraft:elytra"));
-
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    /**
-     * Lấy Java identifier của item từ GeyserItemStack.
-     * Thử nhiều path khác nhau vì Geyser internal API hay thay đổi.
-     */
-    private String getJavaItemId(Object itemStack, Object session) {
-        // Thử getJavaIdentifier trực tiếp
+    private String getJavaId(Object itemStack) {
         for (String m : new String[]{"getJavaIdentifier", "getJavaId", "identifier"}) {
             try {
                 Object r = invokeNoArgs(itemStack, m);
                 if (r != null) return r.toString();
             } catch (Exception ignored) {}
         }
-
-        // Thử qua mapping
-        for (String m : new String[]{"getMapping", "getItemMapping", "mapping"}) {
-            try {
-                Object mapping = invokeNoArgs(itemStack, m);
-                if (mapping == null) {
-                    // Một số version cần truyền session vào
-                    try { mapping = invokeTyped(itemStack, "getMapping",
-                            new Class[]{session.getClass()}, session); } catch (Exception ignored) {}
-                }
-                if (mapping == null) continue;
-                for (String mid : new String[]{"getJavaIdentifier", "javaIdentifier", "identifier"}) {
-                    try {
-                        Object r = invokeNoArgs(mapping, mid);
-                        if (r != null) return r.toString();
-                    } catch (Exception ignored) {}
-                }
-            } catch (Exception ignored) {}
-        }
-
-        // Thử lấy javaId (int) rồi resolve
         try {
-            Object javaIdObj = invokeNoArgs(itemStack, "getJavaId");
-            if (javaIdObj instanceof Number) {
-                // Tìm ItemMapping registry từ session
-                Object itemMappings = invokeNoArgs(session, "getItemMappings");
-                if (itemMappings == null) itemMappings = invokeNoArgs(session, "getMappings");
-                if (itemMappings != null) {
-                    Object mappingEntry = invokeTyped(itemMappings, "getMapping",
-                            new Class[]{int.class}, ((Number) javaIdObj).intValue());
-                    if (mappingEntry != null) {
-                        Object r = invokeNoArgs(mappingEntry, "getJavaIdentifier");
-                        if (r != null) return r.toString();
-                    }
-                }
+            Object mapping = invokeNoArgs(itemStack, "getMapping");
+            if (mapping != null) {
+                Object r = invokeNoArgs(mapping, "getJavaIdentifier");
+                if (r != null) return r.toString();
             }
         } catch (Exception ignored) {}
-
         return null;
     }
 
-    // ── Reflection helpers ──────────────────────────────────────────────────
+    // ── Reflection utils ──────────────────────────────────────────────────────
 
     private Object invokeNoArgs(Object target, String name) throws Exception {
         if (target == null) return null;
@@ -294,7 +313,6 @@ public class ElytraExtension implements Extension {
                 m.setAccessible(true);
                 return m.invoke(target);
             } catch (NoSuchMethodException ignored) {}
-            // check interfaces too
             for (Class<?> iface : clazz.getInterfaces()) {
                 try {
                     Method m = iface.getDeclaredMethod(name);
@@ -352,12 +370,5 @@ public class ElytraExtension implements Extension {
                 return;
             }
         }
-    }
-
-    private Object getEnumConstant(Class<?> enumClass, String name) {
-        for (Object c : enumClass.getEnumConstants()) {
-            if (c.toString().equals(name)) return c;
-        }
-        return null;
     }
 }
