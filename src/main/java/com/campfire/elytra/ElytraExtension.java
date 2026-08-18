@@ -134,7 +134,7 @@ public class ElytraExtension implements Extension {
 
         state.riding      = true;
         state.velocityY   = 0f;
-        logger().debug("[CampfireElytra] Player {} mounted dummy entity {}", conn.playerUuid(), entityId);
+        logger().debug("[CampfireElytra] Player " + conn.playerUuid() + " mounted dummy entity " + entityId);
     }
 
     // ── Di chuyển dummy theo hướng nhìn ───────────────────────────────────────
