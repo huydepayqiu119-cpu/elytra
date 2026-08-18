@@ -9,52 +9,64 @@ import org.geysermc.geyser.api.extension.Extension;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Trick: Giống hệt Bedrock Script approach — swap chestplate thật.
+ * ElytraExtension — Dummy-entity approach
  *
- * Khi player rời mặt đất và đang mặc custom elytra:
- *   → Geyser gửi packet thay chestplate thành minecraft:elytra thật về Bedrock client
- *   → Client thấy elytra thật → glide bình thường, animation đúng
+ * Khi player mặc custom elytra và nhảy lên không:
+ *  1. Geyser gửi AddEntityPacket → spawn dummy entity (invisible) tại vị trí player
+ *  2. SetEntityLinkPacket → player ride dummy entity
+ *  3. Mỗi tick: đọc look direction của player → tính velocity vector →
+ *     gửi MoveEntityAbsolutePacket / SetEntityMotionPacket để di chuyển dummy
+ *  4. Khi player chạm đất hoặc tháo elytra → SetEntityLinkPacket (unlink) +
+ *     RemoveEntityPacket
  *
- * Khi player chạm đất:
- *   → Swap ngược lại custom item
- *
- * Không cần động vào Java server inventory — chỉ thao tác phía Bedrock upstream.
+ * Dummy entity type: dùng "minecraft:area_effect_cloud" hoặc boat —
+ * loại invisible, không có hitbox ảnh hưởng, không bị gravity kéo.
  */
 public class ElytraExtension implements Extension {
 
-    // Các custom elytra identifier (Java item id)
-    // Item chứa "elytra" trong tên (trừ minecraft:elytra) sẽ tự động được nhận
+    // Custom elytra Java identifiers
     private static final Set<String> CUSTOM_ELYTRA_IDS = Set.of(
         "campfire:custom_elytra",
         "campfire:elytra"
-        // thêm identifier của bạn ở đây nếu cần
     );
 
-    // State per player
+    // Entity type dùng làm dummy (area_effect_cloud: invisible, no gravity khi set)
+    private static final String DUMMY_ENTITY_TYPE = "minecraft:area_effect_cloud";
+
+    // Elytra glide speed (blocks/tick ở 20tps)
+    private static final float GLIDE_SPEED        = 0.6f;
+    private static final float GLIDE_SPEED_MIN    = 0.1f;
+    private static final float GRAVITY            = 0.05f; // kéo xuống mỗi tick nếu không glide
+
+    // Runtime ID counter — phải không trùng với entity server thật
+    private static final AtomicLong ENTITY_ID_COUNTER = new AtomicLong(100_000_000L);
+
+    // ── Per-player state ──────────────────────────────────────────────────────
+
     private static class PlayerState {
-        boolean elytraActive = false;      // đang hiển thị elytra thật về phía Bedrock
-        String  savedCustomId = null;      // identifier custom item đã lưu
-        boolean wasAirborne   = false;     // frame trước có trên không không
+        long    dummyEntityId   = -1;   // Bedrock runtime ID của dummy entity
+        boolean riding          = false; // đang ride dummy entity
+        float   velocityX       = 0f;
+        float   velocityY       = 0f;
+        float   velocityZ       = 0f;
+        String  savedCustomId   = null;
     }
 
-    private final Map<UUID, PlayerState>    states    = new ConcurrentHashMap<>();
-    private final Map<UUID, ScheduledFuture<?>> tasks = new ConcurrentHashMap<>();
+    private final Map<UUID, PlayerState>        states    = new ConcurrentHashMap<>();
+    private final Map<UUID, ScheduledFuture<?>> tasks     = new ConcurrentHashMap<>();
     private ScheduledExecutorService scheduler;
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     @Subscribe
     public void onPostInitialize(GeyserPostInitializeEvent event) {
         scheduler = Executors.newScheduledThreadPool(4);
-        logger().info("CampfireElytra enabled.");
+        logger().info("[CampfireElytra] Dummy-entity elytra extension enabled.");
     }
 
     @Subscribe
@@ -62,9 +74,10 @@ public class ElytraExtension implements Extension {
         GeyserConnection conn = event.connection();
         UUID uuid = conn.playerUuid();
         states.put(uuid, new PlayerState());
-        ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(() -> {
-            try { tick(conn); } catch (Exception ignored) {}
-        }, 300, 100, TimeUnit.MILLISECONDS);
+        ScheduledFuture<?> task = scheduler.scheduleAtFixedRate(
+            () -> { try { tick(conn); } catch (Exception ignored) {} },
+            500, 50, TimeUnit.MILLISECONDS // 50ms = 20 tps
+        );
         tasks.put(uuid, task);
     }
 
@@ -73,211 +86,308 @@ public class ElytraExtension implements Extension {
         UUID uuid = event.connection().playerUuid();
         ScheduledFuture<?> t = tasks.remove(uuid);
         if (t != null) t.cancel(false);
-        states.remove(uuid);
+        PlayerState state = states.remove(uuid);
+        if (state != null && state.riding) {
+            try { dismountAndRemoveDummy(event.connection(), state); } catch (Exception ignored) {}
+        }
     }
 
-    // ── Core tick ────────────────────────────────────────────────────────────
+    // ── Tick ─────────────────────────────────────────────────────────────────
 
-    private void tick(GeyserConnection connection) throws Exception {
-        Object session = connection;
-        UUID uuid = connection.playerUuid();
+    private void tick(GeyserConnection conn) throws Exception {
+        UUID uuid = conn.playerUuid();
         PlayerState state = states.get(uuid);
         if (state == null) return;
 
-        // Lấy inventory Bedrock-side (GeyserItemStack)
-        Object inventory = invokeNoArgs(session, "getPlayerInventory");
-        if (inventory == null) return;
+        boolean wearingCustom = isWearingCustomElytra(conn, state);
+        boolean airborne      = isAirborne(conn);
 
-        Object chestItem = invokeNoArgs(inventory, "getChestplate");
-
-        // Kiểm tra player có đang trên không không
-        boolean airborne = isAirborne(session);
-
-        if (!state.elytraActive) {
-            // --- Chưa swap: kiểm tra xem có nên swap sang elytra không ---
-            if (chestItem == null) return;
-            String customId = getJavaId(chestItem);
-            if (!isCustomElytra(customId)) return;
-
-            if (airborne) {
-                // Swap: ghi nhớ custom item rồi gửi elytra về phía Bedrock
-                state.savedCustomId  = customId;
-                state.elytraActive   = true;
-                sendChestplatePacket(session, "minecraft:elytra");
+        if (!state.riding) {
+            // Bắt đầu glide: đang mặc custom elytra + trên không
+            if (wearingCustom && airborne) {
+                spawnAndMount(conn, state);
             }
         } else {
-            // --- Đang swap: kiểm tra có nên swap ngược lại không ---
-            if (!airborne && state.wasAirborne) {
-                // Vừa chạm đất → swap lại
-                state.elytraActive = false;
-                String restoreId = state.savedCustomId != null ? state.savedCustomId : "minecraft:elytra";
-                sendChestplatePacket(session, restoreId);
-                state.savedCustomId = null;
+            // Đang glide
+            if (!wearingCustom || !airborne) {
+                // Tháo elytra hoặc chạm đất → dừng
+                dismountAndRemoveDummy(conn, state);
+            } else {
+                // Tiếp tục: cập nhật vị trí dummy theo look direction
+                updateGlide(conn, state);
             }
         }
-
-        state.wasAirborne = airborne;
     }
 
-    // ── Gửi packet đổi chestplate về Bedrock client ──────────────────────────
+    // ── Spawn dummy + cho player ride ─────────────────────────────────────────
 
-    /**
-     * Gửi MobEquipmentPacket / InventorySlotPacket về phía Bedrock để client
-     * thấy chestplate thay đổi mà không thật sự thay đổi Java inventory.
-     */
-    private void sendChestplatePacket(Object session, String itemId) {
-        try {
-            // Lấy ItemMapping cho itemId từ ItemMappings của session
-            Object itemMappings = getItemMappings(session);
-            if (itemMappings == null) return;
+    private void spawnAndMount(GeyserConnection conn, PlayerState state) throws Exception {
+        long entityId = ENTITY_ID_COUNTER.getAndIncrement();
+        state.dummyEntityId = entityId;
 
-            Object bedrockData = resolveBedrockItem(itemMappings, itemId);
-            if (bedrockData == null) return;
+        // Vị trí hiện tại của player
+        float[] pos = getPlayerPosition(conn);
+        if (pos == null) return;
 
-            // Build InventorySlotPacket (slot 6 = chestplate trong Bedrock inventory)
-            Class<?> packetClass = Class.forName(
-                "org.cloudburstmc.protocol.bedrock.packet.InventorySlotPacket");
-            Object packet = packetClass.getDeclaredConstructor().newInstance();
+        sendAddEntityPacket(conn, entityId, pos[0], pos[1], pos[2]);
+        sendSetEntityLinkPacket(conn, entityId, getPlayerRuntimeId(conn), true);
 
-            // containerId = 0 (player inventory), slot 6 = chestplate
-            setField(packet, "containerId", 0);
-            setField(packet, "slot", 6);
-            setField(packet, "item", bedrockData);
-
-            Class<?> bedrockPacketClass = Class.forName(
-                "org.cloudburstmc.protocol.bedrock.packet.BedrockPacket");
-            invokeTyped(session, "sendUpstreamPacket",
-                new Class[]{bedrockPacketClass}, packet);
-
-        } catch (Exception e) {
-            // Fallback: thử MobEquipmentPacket
-            try { sendMobEquipmentPacket(session, itemId); } catch (Exception ignored) {}
-        }
+        state.riding      = true;
+        state.velocityY   = 0f;
+        logger().debug("[CampfireElytra] Player {} mounted dummy entity {}", conn.playerUuid(), entityId);
     }
 
-    private void sendMobEquipmentPacket(Object session, String itemId) throws Exception {
-        Object itemMappings = getItemMappings(session);
-        if (itemMappings == null) return;
+    // ── Di chuyển dummy theo hướng nhìn ───────────────────────────────────────
 
-        Object bedrockData = resolveBedrockItem(itemMappings, itemId);
-        if (bedrockData == null) return;
+    private void updateGlide(GeyserConnection conn, PlayerState state) throws Exception {
+        float[] rot = getPlayerRotation(conn); // [yaw, pitch]
+        float[] pos = getPlayerPosition(conn);
+        if (rot == null || pos == null) return;
 
-        Object playerEntity = invokeNoArgs(session, "getPlayerEntity");
-        if (playerEntity == null) return;
-        long runtimeId = ((Number) invokeNoArgs(playerEntity, "getGeyserId")).longValue();
+        float yaw   = rot[0];
+        float pitch = rot[1];
 
-        Class<?> packetClass = Class.forName(
-            "org.cloudburstmc.protocol.bedrock.packet.MobEquipmentPacket");
-        Object packet = packetClass.getDeclaredConstructor().newInstance();
-        setField(packet, "runtimeEntityId", runtimeId);
-        setField(packet, "item", bedrockData);
-        setField(packet, "inventorySlot", 6);
-        setField(packet, "hotbarSlot", 0);
-        setField(packet, "containerId", (byte) 6); // ARMOR container
+        // Tính vector hướng nhìn
+        double pitchRad = Math.toRadians(pitch);
+        double yawRad   = Math.toRadians(yaw);
 
-        Class<?> bedrockPacketClass = Class.forName(
+        float speed = GLIDE_SPEED;
+        // Pitch dương = nhìn xuống → giảm tốc dọc, pitch âm = nhìn lên
+        float hSpeed = (float)(speed * Math.cos(pitchRad));
+        float vSpeed = (float)(-speed * Math.sin(pitchRad));
+
+        state.velocityX = (float)(-hSpeed * Math.sin(yawRad));
+        state.velocityY = vSpeed;
+        state.velocityZ = (float)( hSpeed * Math.cos(yawRad));
+
+        float newX = pos[0] + state.velocityX;
+        float newY = pos[1] + state.velocityY;
+        float newZ = pos[2] + state.velocityZ;
+
+        sendMoveEntityPacket(conn, state.dummyEntityId, newX, newY, newZ, yaw, pitch);
+        sendSetEntityMotionPacket(conn, state.dummyEntityId,
+            state.velocityX, state.velocityY, state.velocityZ);
+    }
+
+    // ── Dismount + remove dummy ───────────────────────────────────────────────
+
+    private void dismountAndRemoveDummy(GeyserConnection conn, PlayerState state) throws Exception {
+        if (state.dummyEntityId < 0) return;
+        sendSetEntityLinkPacket(conn, state.dummyEntityId, getPlayerRuntimeId(conn), false);
+        sendRemoveEntityPacket(conn, state.dummyEntityId);
+        state.riding      = false;
+        state.dummyEntityId = -1;
+        state.velocityX = state.velocityY = state.velocityZ = 0f;
+    }
+
+    // ── Packet senders ────────────────────────────────────────────────────────
+
+    private void sendAddEntityPacket(GeyserConnection conn, long entityId,
+                                     float x, float y, float z) throws Exception {
+        Class<?> pkClass = Class.forName(
+            "org.cloudburstmc.protocol.bedrock.packet.AddEntityPacket");
+        Object pk = pkClass.getDeclaredConstructor().newInstance();
+
+        setField(pk, "runtimeEntityId",   entityId);
+        setField(pk, "uniqueEntityId",    entityId);
+        setField(pk, "identifier",        DUMMY_ENTITY_TYPE);
+
+        // Position
+        Object vecClass3f = buildVector3f(x, y, z);
+        setField(pk, "position", vecClass3f);
+        setField(pk, "motion",   buildVector3f(0, 0, 0));
+        setField(pk, "rotation", buildVector2f(0, 0));
+
+        // Attributes + metadata lists
+        trySetEmptyList(pk, "attributes");
+        trySetEmptyList(pk, "metadata");
+        trySetEmptyList(pk, "links");
+        trySetEmptyMap(pk, "properties");
+
+        sendUpstream(conn, pk);
+    }
+
+    private void sendSetEntityLinkPacket(GeyserConnection conn, long riderOf,
+                                          long riderId, boolean mount) throws Exception {
+        Class<?> pkClass = Class.forName(
+            "org.cloudburstmc.protocol.bedrock.packet.SetEntityLinkPacket");
+        Object pk = pkClass.getDeclaredConstructor().newInstance();
+
+        // EntityLinkData(from, to, type, immediate, passengerInitiated)
+        Class<?> linkClass = Class.forName(
+            "org.cloudburstmc.protocol.bedrock.data.entity.EntityLinkData");
+        Class<?> linkTypeClass = Class.forName(
+            "org.cloudburstmc.protocol.bedrock.data.entity.EntityLinkData$Type");
+        Object linkType = mount
+            ? getEnumConstant(linkTypeClass, "RIDER")
+            : getEnumConstant(linkTypeClass, "REMOVE");
+
+        Object link = linkClass.getDeclaredConstructors()[0].newInstance(
+            riderOf, riderId, linkType, true, false
+        );
+        setField(pk, "entityLink", link);
+        sendUpstream(conn, pk);
+    }
+
+    private void sendMoveEntityPacket(GeyserConnection conn, long entityId,
+                                       float x, float y, float z,
+                                       float yaw, float pitch) throws Exception {
+        Class<?> pkClass = Class.forName(
+            "org.cloudburstmc.protocol.bedrock.packet.MoveEntityAbsolutePacket");
+        Object pk = pkClass.getDeclaredConstructor().newInstance();
+
+        setField(pk, "runtimeEntityId", entityId);
+        setField(pk, "position",        buildVector3f(x, y, z));
+        setField(pk, "rotation",        buildVector3f(pitch, yaw, 0)); // pitch, yaw, roll
+        setField(pk, "onGround",        false);
+        setField(pk, "teleported",      false);
+        sendUpstream(conn, pk);
+    }
+
+    private void sendSetEntityMotionPacket(GeyserConnection conn, long entityId,
+                                            float vx, float vy, float vz) throws Exception {
+        Class<?> pkClass = Class.forName(
+            "org.cloudburstmc.protocol.bedrock.packet.SetEntityMotionPacket");
+        Object pk = pkClass.getDeclaredConstructor().newInstance();
+
+        setField(pk, "runtimeEntityId", entityId);
+        setField(pk, "motion",          buildVector3f(vx, vy, vz));
+        sendUpstream(conn, pk);
+    }
+
+    private void sendRemoveEntityPacket(GeyserConnection conn, long entityId) throws Exception {
+        Class<?> pkClass = Class.forName(
+            "org.cloudburstmc.protocol.bedrock.packet.RemoveEntityPacket");
+        Object pk = pkClass.getDeclaredConstructor().newInstance();
+        setField(pk, "uniqueEntityId", entityId);
+        sendUpstream(conn, pk);
+    }
+
+    private void sendUpstream(GeyserConnection conn, Object packet) throws Exception {
+        Class<?> bedrockPk = Class.forName(
             "org.cloudburstmc.protocol.bedrock.packet.BedrockPacket");
-        invokeTyped(session, "sendUpstreamPacket",
-            new Class[]{bedrockPacketClass}, packet);
+        invokeTyped(conn, "sendUpstreamPacket", new Class[]{bedrockPk}, packet);
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
+    // ── Player state helpers ──────────────────────────────────────────────────
 
-    private boolean isAirborne(Object session) {
+    private boolean isWearingCustomElytra(GeyserConnection conn, PlayerState state) {
         try {
-            // Thử đọc onGround flag từ playerEntity
-            Object playerEntity = invokeNoArgs(session, "getPlayerEntity");
-            if (playerEntity == null) return false;
+            Object inventory = invokeNoArgs(conn, "getPlayerInventory");
+            if (inventory == null) return false;
+            Object chest = invokeNoArgs(inventory, "getChestplate");
+            if (chest == null) return false;
+            String id = getJavaId(chest);
+            boolean is = isCustomElytra(id);
+            if (is) state.savedCustomId = id;
+            return is;
+        } catch (Exception e) { return false; }
+    }
 
+    private boolean isAirborne(GeyserConnection conn) {
+        try {
+            Object playerEntity = invokeNoArgs(conn, "getPlayerEntity");
+            if (playerEntity == null) return false;
             for (String f : new String[]{"onGround", "isOnGround"}) {
+                try { Object v = getFieldVal(playerEntity, f); if (v instanceof Boolean b) return !b; } catch (Exception ignored) {}
+                try { Object v = invokeNoArgs(playerEntity, f);  if (v instanceof Boolean b) return !b; } catch (Exception ignored) {}
+            }
+            Object v = invokeNoArgs(conn, "isOnGround");
+            if (v instanceof Boolean b) return !b;
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    private float[] getPlayerPosition(GeyserConnection conn) {
+        try {
+            Object entity = invokeNoArgs(conn, "getPlayerEntity");
+            if (entity == null) return null;
+            Object pos = invokeNoArgs(entity, "getPosition");
+            if (pos == null) return null;
+            float x = ((Number) invokeNoArgs(pos, "getX")).floatValue();
+            float y = ((Number) invokeNoArgs(pos, "getY")).floatValue();
+            float z = ((Number) invokeNoArgs(pos, "getZ")).floatValue();
+            return new float[]{x, y, z};
+        } catch (Exception e) { return null; }
+    }
+
+    /** Returns [yaw, pitch] in degrees */
+    private float[] getPlayerRotation(GeyserConnection conn) {
+        try {
+            Object entity = invokeNoArgs(conn, "getPlayerEntity");
+            if (entity == null) return null;
+            // Geyser entity thường có rotation() trả về Vector3f(pitch, headYaw, bodyYaw)
+            // hoặc các field riêng
+            for (String m : new String[]{"getRotation", "rotation"}) {
                 try {
-                    Object val = getField(playerEntity, f);
-                    if (val instanceof Boolean b) return !b;
-                } catch (Exception ignored) {}
-                try {
-                    Object val = invokeNoArgs(playerEntity, f);
-                    if (val instanceof Boolean b) return !b;
+                    Object rot = invokeNoArgs(entity, m);
+                    if (rot == null) continue;
+                    float pitch = ((Number) invokeNoArgs(rot, "getX")).floatValue();
+                    float yaw   = ((Number) invokeNoArgs(rot, "getY")).floatValue();
+                    return new float[]{yaw, pitch};
                 } catch (Exception ignored) {}
             }
-
-            // Fallback: đọc qua Geyser connection API
-            Object onGround = invokeNoArgs(session, "isOnGround");
-            if (onGround instanceof Boolean b) return !b;
-
-            return false;
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    private Object getItemMappings(Object session) {
-        for (String m : new String[]{"getItemMappings", "getMappings", "getCodecHelper"}) {
-            try {
-                Object r = invokeNoArgs(session, m);
-                if (r != null) return r;
-            } catch (Exception ignored) {}
-        }
-        try {
-            // Thử qua upstream session
-            Object upstream = getField(session, "upstream");
-            if (upstream != null) return invokeNoArgs(upstream, "getItemDefinitions");
-        } catch (Exception ignored) {}
-        return null;
-    }
-
-    /**
-     * Resolve Bedrock ItemData từ Java identifier.
-     * Trả về ItemData object để nhét vào packet.
-     */
-    private Object resolveBedrockItem(Object itemMappings, String javaId) {
-        try {
-            // Thử getMapping(String) trực tiếp
-            for (String m : new String[]{"getMapping", "getItemMapping", "getMappingByJavaIdentifier"}) {
+            // Fallback: đọc field
+            for (String f : new String[]{"yaw", "headYaw"}) {
                 try {
-                    Object mapping = invokeTyped(itemMappings, m,
-                        new Class[]{String.class}, javaId);
-                    if (mapping != null) {
-                        // Convert mapping → ItemData
-                        return mappingToItemData(mapping);
+                    Object yawObj   = getFieldVal(entity, f);
+                    Object pitchObj = getFieldVal(entity, "pitch");
+                    if (yawObj != null && pitchObj != null) {
+                        return new float[]{
+                            ((Number) yawObj).floatValue(),
+                            ((Number) pitchObj).floatValue()
+                        };
                     }
                 } catch (Exception ignored) {}
             }
+        } catch (Exception ignored) {}
+        return new float[]{0f, 0f};
+    }
 
-            // Thử duyệt mappings list
-            Object mappingsList = invokeNoArgs(itemMappings, "getItems");
-            if (mappingsList instanceof Iterable<?> it) {
-                for (Object entry : it) {
-                    try {
-                        Object id = invokeNoArgs(entry, "getJavaIdentifier");
-                        if (id != null && id.toString().equals(javaId)) {
-                            return mappingToItemData(entry);
-                        }
-                    } catch (Exception ignored) {}
-                }
+    private long getPlayerRuntimeId(GeyserConnection conn) {
+        try {
+            Object entity = invokeNoArgs(conn, "getPlayerEntity");
+            if (entity == null) return 0L;
+            for (String m : new String[]{"getGeyserId", "getRuntimeId", "runtimeId"}) {
+                try {
+                    Object v = invokeNoArgs(entity, m);
+                    if (v instanceof Number n) return n.longValue();
+                } catch (Exception ignored) {}
             }
         } catch (Exception ignored) {}
-        return null;
+        return 0L;
     }
 
-    private Object mappingToItemData(Object mapping) throws Exception {
-        // Thử getItemData() trực tiếp
-        try {
-            Object data = invokeNoArgs(mapping, "getItemData");
-            if (data != null) return data;
-        } catch (Exception ignored) {}
+    // ── Util builders ─────────────────────────────────────────────────────────
 
-        // Build ItemData từ bedrockId + bedrockData
-        Object bedrockIdObj = invokeNoArgs(mapping, "getBedrockId");
-        if (bedrockIdObj == null) return null;
-        int bedrockId = ((Number) bedrockIdObj).intValue();
-
-        Class<?> itemDataClass = Class.forName("org.cloudburstmc.protocol.bedrock.data.inventory.ItemData");
-        // ItemData.builder().id(x).count(1).build()
-        Object builder = itemDataClass.getMethod("builder").invoke(null);
-        invokeTyped(builder, "id", new Class[]{int.class}, bedrockId);
-        invokeTyped(builder, "count", new Class[]{int.class}, 1);
-        return invokeNoArgs(builder, "build");
+    private Object buildVector3f(float x, float y, float z) throws Exception {
+        Class<?> cls = Class.forName("org.cloudburstmc.math.vector.Vector3f");
+        return cls.getMethod("from", float.class, float.class, float.class).invoke(null, x, y, z);
     }
+
+    private Object buildVector2f(float x, float y) throws Exception {
+        Class<?> cls = Class.forName("org.cloudburstmc.math.vector.Vector2f");
+        return cls.getMethod("from", float.class, float.class).invoke(null, x, y);
+    }
+
+    private Object getEnumConstant(Class<?> enumClass, String name) {
+        for (Object c : enumClass.getEnumConstants()) {
+            if (c.toString().equals(name)) return c;
+        }
+        return enumClass.getEnumConstants()[0];
+    }
+
+    @SuppressWarnings("unchecked")
+    private void trySetEmptyList(Object target, String fieldName) {
+        try { setField(target, fieldName, new ArrayList<>()); } catch (Exception ignored) {}
+    }
+
+    @SuppressWarnings("unchecked")
+    private void trySetEmptyMap(Object target, String fieldName) {
+        try { setField(target, fieldName, new HashMap<>()); } catch (Exception ignored) {}
+    }
+
+    // ── Domain helpers ────────────────────────────────────────────────────────
 
     private boolean isCustomElytra(String id) {
         if (id == null) return false;
@@ -287,10 +397,8 @@ public class ElytraExtension implements Extension {
 
     private String getJavaId(Object itemStack) {
         for (String m : new String[]{"getJavaIdentifier", "getJavaId", "identifier"}) {
-            try {
-                Object r = invokeNoArgs(itemStack, m);
-                if (r != null) return r.toString();
-            } catch (Exception ignored) {}
+            try { Object r = invokeNoArgs(itemStack, m); if (r != null) return r.toString(); }
+            catch (Exception ignored) {}
         }
         try {
             Object mapping = invokeNoArgs(itemStack, "getMapping");
@@ -308,17 +416,11 @@ public class ElytraExtension implements Extension {
         if (target == null) return null;
         Class<?> clazz = target.getClass();
         while (clazz != null) {
-            try {
-                Method m = clazz.getDeclaredMethod(name);
-                m.setAccessible(true);
-                return m.invoke(target);
-            } catch (NoSuchMethodException ignored) {}
+            try { Method m = clazz.getDeclaredMethod(name); m.setAccessible(true); return m.invoke(target); }
+            catch (NoSuchMethodException ignored) {}
             for (Class<?> iface : clazz.getInterfaces()) {
-                try {
-                    Method m = iface.getDeclaredMethod(name);
-                    m.setAccessible(true);
-                    return m.invoke(target);
-                } catch (NoSuchMethodException ignored) {}
+                try { Method m = iface.getDeclaredMethod(name); m.setAccessible(true); return m.invoke(target); }
+                catch (NoSuchMethodException ignored) {}
             }
             clazz = clazz.getSuperclass();
         }
@@ -329,29 +431,20 @@ public class ElytraExtension implements Extension {
         if (target == null) return null;
         Class<?> clazz = target.getClass();
         while (clazz != null) {
-            try {
-                Method m = clazz.getDeclaredMethod(name, types);
-                m.setAccessible(true);
-                return m.invoke(target, args);
-            } catch (NoSuchMethodException ignored) {}
+            try { Method m = clazz.getDeclaredMethod(name, types); m.setAccessible(true); return m.invoke(target, args); }
+            catch (NoSuchMethodException ignored) {}
             clazz = clazz.getSuperclass();
         }
         return null;
     }
 
-    private Object getField(Object target, String name) {
+    private Object getFieldVal(Object target, String name) {
         if (target == null) return null;
         Class<?> clazz = target.getClass();
         while (clazz != null) {
-            try {
-                Field f = clazz.getDeclaredField(name);
-                f.setAccessible(true);
-                return f.get(target);
-            } catch (NoSuchFieldException ignored) {
-                clazz = clazz.getSuperclass();
-            } catch (Exception e) {
-                return null;
-            }
+            try { Field f = clazz.getDeclaredField(name); f.setAccessible(true); return f.get(target); }
+            catch (NoSuchFieldException ignored) { clazz = clazz.getSuperclass(); }
+            catch (Exception e) { return null; }
         }
         return null;
     }
@@ -359,16 +452,9 @@ public class ElytraExtension implements Extension {
     private void setField(Object target, String name, Object value) {
         Class<?> clazz = target.getClass();
         while (clazz != null) {
-            try {
-                Field f = clazz.getDeclaredField(name);
-                f.setAccessible(true);
-                f.set(target, value);
-                return;
-            } catch (NoSuchFieldException ignored) {
-                clazz = clazz.getSuperclass();
-            } catch (Exception e) {
-                return;
-            }
+            try { Field f = clazz.getDeclaredField(name); f.setAccessible(true); f.set(target, value); return; }
+            catch (NoSuchFieldException ignored) { clazz = clazz.getSuperclass(); }
+            catch (Exception e) { return; }
         }
     }
 }
