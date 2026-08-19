@@ -191,7 +191,8 @@ public class ElytraExtension implements Extension {
                     getComponentMethod = itemStack.getClass().getMethod("getComponent", dcType);
                 }
                 Object result = getComponentMethod.invoke(itemStack, itemModelType);
-                if (result != null) return result.toString();
+                logger().info("[CampfireElytra] item_model=" + result);
+                if (result != null && !result.toString().equals("minecraft:elytra")) return result.toString();
             } catch (Exception e) {
                 componentApiAvailable = false;
                 logger().warning("[CampfireElytra] item_model component unavailable, falling back to CustomModelData: " + e.getMessage());
