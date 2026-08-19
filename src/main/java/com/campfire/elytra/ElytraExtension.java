@@ -201,25 +201,23 @@ public class ElytraExtension implements Extension {
 
         // Fallback: CustomModelData NBT (legacy mapping type)
         try {
-            for (String m : new String[]{"getCustomModelData", "customModelData"}) {
-                try {
-                    Object v = itemStack.getClass().getMethod(m).invoke(itemStack);
-                    logger().info("[CampfireElytra] " + m + "=" + v);
-                    if (v instanceof Number n && n.intValue() != 0) {
-                        return customModelDataToModel(n.intValue());
-                    }
-                } catch (NoSuchMethodException ignored) {}
-            }
-            Object mapping = itemStack.getClass().getMethod("getMapping").invoke(itemStack);
-            if (mapping != null) {
-                Object cmd = mapping.getClass().getMethod("getCustomModelData").invoke(mapping);
-                logger().info("[CampfireElytra] mapping.customModelData=" + cmd);
-                if (cmd instanceof Number n && n.intValue() != 0) {
-                    return customModelDataToModel(n.intValue());
+            // Log tất cả methods để tìm đúng tên
+            logger().info("[CampfireElytra] GeyserItemStack methods:");
+            for (Method m : itemStack.getClass().getMethods()) {
+                if (m.getName().toLowerCase().contains("custom") || 
+                    m.getName().toLowerCase().contains("model") ||
+                    m.getName().toLowerCase().contains("nbt") ||
+                    m.getName().toLowerCase().contains("tag") ||
+                    m.getName().toLowerCase().contains("component") ||
+                    m.getName().toLowerCase().contains("data")) {
+                    logger().info("  -> " + m.getName() + "(" + 
+                        java.util.Arrays.stream(m.getParameterTypes())
+                            .map(Class::getSimpleName)
+                            .collect(java.util.stream.Collectors.joining(",")) + ")");
                 }
             }
         } catch (Exception e) {
-            logger().warning("[CampfireElytra] CMD fallback failed: " + e);
+            logger().warning("[CampfireElytra] method list failed: " + e);
         }
         return null;
     }
