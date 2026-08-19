@@ -123,6 +123,18 @@ public class ElytraGeyserExtension implements Extension {
 
     private boolean isArmorStand(Object entity) {
         try {
+            // Ưu tiên check scoreboard tag "campfire_elytra_mount"
+            for (String m : new String[]{"getScoreboardTags", "getTags"}) {
+                try {
+                    Object tags = invokeNoArgs(entity, m);
+                    if (tags instanceof Collection<?> col) {
+                        for (Object t : col) {
+                            if ("campfire_elytra_mount".equals(t.toString())) return true;
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+            // Fallback: check entity type string
             String type = getEntityDefinitionString(entity);
             return type != null && type.contains("armor_stand");
         } catch (Exception ignored) {}

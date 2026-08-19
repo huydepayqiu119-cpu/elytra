@@ -56,19 +56,40 @@ public class ElytraSpigotPlugin extends JavaPlugin implements Listener {
     private boolean isWearingCustomElytra(Player player) {
         var chest = player.getInventory().getChestplate();
         if (chest == null) return false;
-        // Kiểm tra item_model component hoặc custom model data
+        if (chest.getType() != org.bukkit.Material.ELYTRA) return false;
+
         var meta = chest.getItemMeta();
         if (meta == null) return false;
-        // Nexo item có custom model data hoặc item model
+
+        // 1. Thử item_model (Paper 1.21+)
         try {
             var itemModel = meta.getClass().getMethod("getItemModel").invoke(meta);
             if (itemModel != null) {
                 String id = itemModel.toString();
-                if (!id.equals("minecraft:elytra") && id.contains("elytra")) return true;
+                if (!id.isEmpty() && !id.equals("minecraft:elytra")) return true;
             }
         } catch (Exception ignored) {}
-        return meta.hasCustomModelData() && chest.getType().name().equals("ELYTRA");
+
+        // 2. Custom model data (legacy)
+        if (meta.hasCustomModelData()) return true;
+
+        // 3. Nexo/Oraxen persistent data
+        try {
+            var pdc = chest.getItemMeta().getPersistentDataContainer();
+            // Nexo tag key: "nexo:id"
+            for (org.bukkit.NamespacedKey key : pdc.getKeys()) {
+                if (key.getKey().equals("id") &&
+                    (key.getNamespace().equals("nexo") || key.getNamespace().equals("oraxen"))) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {}
+
+        return false;
     }
+
+    // Tag để đánh dấu ArmorStand là elytra mount
+    private static final String MOUNT_TAG = "campfire_elytra_mount";
 
     private void spawnMount(Player player) {
         if (mounts.containsKey(player.getUniqueId())) return;
@@ -81,6 +102,7 @@ public class ElytraSpigotPlugin extends JavaPlugin implements Listener {
             e.setSmall(true);
             e.setMarker(true);
             e.setPersistent(false);
+            e.addScoreboardTag(MOUNT_TAG);
         });
 
         mounts.put(player.getUniqueId(), stand.getUniqueId());
