@@ -199,25 +199,17 @@ public class ElytraExtension implements Extension {
             }
         }
 
-        // Fallback: CustomModelData NBT (legacy mapping type)
+        // Fallback: dump tất cả components để tìm CustomModelData
         try {
-            // Log tất cả methods để tìm đúng tên
-            logger().info("[CampfireElytra] GeyserItemStack methods:");
-            for (Method m : itemStack.getClass().getMethods()) {
-                if (m.getName().toLowerCase().contains("custom") || 
-                    m.getName().toLowerCase().contains("model") ||
-                    m.getName().toLowerCase().contains("nbt") ||
-                    m.getName().toLowerCase().contains("tag") ||
-                    m.getName().toLowerCase().contains("component") ||
-                    m.getName().toLowerCase().contains("data")) {
-                    logger().info("  -> " + m.getName() + "(" + 
-                        java.util.Arrays.stream(m.getParameterTypes())
-                            .map(Class::getSimpleName)
-                            .collect(java.util.stream.Collectors.joining(",")) + ")");
+            Object allComponents = itemStack.getClass().getMethod("getAllComponents").invoke(itemStack);
+            logger().info("[CampfireElytra] getAllComponents=" + allComponents);
+            if (allComponents instanceof Map<?,?> map) {
+                for (Map.Entry<?,?> e : map.entrySet()) {
+                    logger().info("[CampfireElytra]   component: " + e.getKey() + " = " + e.getValue());
                 }
             }
         } catch (Exception e) {
-            logger().warning("[CampfireElytra] method list failed: " + e);
+            logger().warning("[CampfireElytra] getAllComponents failed: " + e);
         }
         return null;
     }
