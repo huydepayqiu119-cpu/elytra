@@ -124,8 +124,8 @@ public class ElytraExtension implements Extension {
 
             Integer prev = cache.put(uuid, variant);
             if (prev == null || prev != variant) {
+                logger().info("[CampfireElytra] variant changed " + prev + " -> " + variant + ", calling updateProperty");
                 updateProperty(playerEntity, variant);
-                logger().info("[CampfireElytra] updateProperty -> " + variant + " for " + uuid);
             }
         }
 
@@ -230,14 +230,20 @@ public class ElytraExtension implements Extension {
     /** Gọi playerEntity.updateProperty(elytraProperty, variant) */
     private void updateProperty(Object playerEntity, int variant) {
         try {
+            // Log tất cả method tên updateProperty để debug
+            for (Method m : playerEntity.getClass().getMethods()) {
+                if (m.getName().equals("updateProperty")) {
+                    logger().info("[CampfireElytra] found updateProperty: " + m);
+                }
+            }
             for (Method m : playerEntity.getClass().getMethods()) {
                 if (m.getName().equals("updateProperty") && m.getParameterCount() == 2) {
                     m.invoke(playerEntity, elytraProperty, variant);
-                    logger().info("[CampfireElytra] updateProperty called successfully, method=" + m);
+                    logger().info("[CampfireElytra] updateProperty OK variant=" + variant);
                     return;
                 }
             }
-            logger().warning("[CampfireElytra] updateProperty method NOT FOUND on " + playerEntity.getClass().getName());
+            logger().warning("[CampfireElytra] updateProperty NOT FOUND on " + playerEntity.getClass().getName());
         } catch (Exception e) {
             logger().warning("[CampfireElytra] updateProperty failed: " + e);
         }
