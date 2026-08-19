@@ -175,24 +175,64 @@ public class ElytraExtension implements Extension {
 
     /** Đọc item_model component từ GeyserItemStack qua reflection lazy */
     private String getItemModel(Object itemStack) {
-        if (!componentApiAvailable) return null;
-        try {
-            if (getComponentMethod == null || itemModelType == null) {
-                Class<?> dcTypes = Class.forName(
-                    "org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes");
-                itemModelType = dcTypes.getField("ITEM_MODEL").get(null);
-
-                Class<?> dcType = Class.forName(
-                    "org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentType");
-                getComponentMethod = itemStack.getClass().getMethod("getComponent", dcType);
+        // Thử item_model component trước (Java 1.21+)
+        if (componentApiAvailable) {
+            try {
+                if (getComponentMethod == null || itemModelType == null) {
+                    Class<?> dcTypes = Class.forName(
+                        "org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes");
+                    itemModelType = dcTypes.getField("ITEM_MODEL").get(null);
+                    Class<?> dcType = Class.forName(
+                        "org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentType");
+                    getComponentMethod = itemStack.getClass().getMethod("getComponent", dcType);
+                }
+                Object result = getComponentMethod.invoke(itemStack, itemModelType);
+                if (result != null) return result.toString();
+            } catch (Exception e) {
+                componentApiAvailable = false;
+                logger().warning("[CampfireElytra] item_model component unavailable, falling back to CustomModelData: " + e.getMessage());
             }
-            Object result = getComponentMethod.invoke(itemStack, itemModelType);
-            return result != null ? result.toString() : null;
-        } catch (Exception e) {
-            componentApiAvailable = false;
-            logger().warning("[CampfireElytra] item_model component unavailable: " + e.getMessage());
-            return null;
         }
+
+        // Fallback: CustomModelData NBT (legacy mapping type)
+        try {
+            // getCustomModelData() hoặc getMapping().getCustomModelData()
+            for (String m : new String[]{"getCustomModelData", "customModelData"}) {
+                try {
+                    Object v = itemStack.getClass().getMethod(m).invoke(itemStack);
+                    if (v instanceof Number n && n.intValue() != 0) {
+                        // Tra ngược từ customModelData → item_model id
+                        return customModelDataToModel(n.intValue());
+                    }
+                } catch (NoSuchMethodException ignored) {}
+            }
+            // Thử qua mapping
+            Object mapping = itemStack.getClass().getMethod("getMapping").invoke(itemStack);
+            if (mapping != null) {
+                Object cmd = mapping.getClass().getMethod("getCustomModelData").invoke(mapping);
+                if (cmd instanceof Number n && n.intValue() != 0) {
+                    return customModelDataToModel(n.intValue());
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
+    }
+
+    /** Map CustomModelData int → item_model string (khớp với Geyser mapping JSON) */
+    private String customModelDataToModel(int cmd) {
+        // Tra ngược VARIANTS map hoặc dùng hardcode theo mapping file
+        for (Map.Entry<String, Integer> e : VARIANTS.entrySet()) {
+            // Nếu variant index khớp với cmd (legacy mapping dùng cmd làm variant)
+        }
+        // Fallback: dùng map riêng cho CustomModelData
+        return CMD_MAP.get(cmd);
+    }
+
+    // Map CustomModelData → item_model id (theo file mapping JSON của bạn)
+    private static final Map<Integer, String> CMD_MAP = new HashMap<>();
+    static {
+        CMD_MAP.put(1000, "campfire:custom_elytra");
+        // Thêm các CMD khác tại đây nếu có
     }
 
     /** Gọi playerEntity.updateProperty(elytraProperty, variant) */
