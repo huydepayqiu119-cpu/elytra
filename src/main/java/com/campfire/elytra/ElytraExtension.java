@@ -76,7 +76,7 @@ public class ElytraExtension implements Extension {
             elytraProperty = event.registerIntegerProperty(player, prop, 0, MAX_VARIANTS, 0);
             logger().info("[CampfireElytra] Registered entity property campfire:elytra");
         } catch (Exception e) {
-            logger().warn("[CampfireElytra] Failed to register entity property: " + e);
+            logger().warning("[CampfireElytra] Failed to register entity property: " + e);
         }
     }
 
@@ -190,7 +190,7 @@ public class ElytraExtension implements Extension {
             return result != null ? result.toString() : null;
         } catch (Exception e) {
             componentApiAvailable = false;
-            logger().warn("[CampfireElytra] item_model component unavailable: " + e.getMessage());
+            logger().warning("[CampfireElytra] item_model component unavailable: " + e.getMessage());
             return null;
         }
     }
