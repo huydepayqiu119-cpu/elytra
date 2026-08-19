@@ -113,8 +113,8 @@ public class ElytraExtension implements Extension {
         ConcurrentHashMap<UUID, Integer> cache = sessions.get(session);
         if (cache == null) return;
 
-        // Lấy danh sách player entities trong session (bản thân + others)
         List<Object> players = getPlayerEntities(session);
+        logger().info("[CampfireElytra] sweep: " + players.size() + " player entities found");
 
         Set<UUID> seen = new HashSet<>();
         for (Object playerEntity : players) {
@@ -123,15 +123,15 @@ public class ElytraExtension implements Extension {
 
             String model  = wornElytraItemModel(session, playerEntity);
             int   variant = model != null ? VARIANTS.getOrDefault(model, 0) : 0;
+            logger().info("[CampfireElytra] uuid=" + uuid + " model=" + model + " variant=" + variant);
 
-            // Chỉ update khi thay đổi
             Integer prev = cache.put(uuid, variant);
             if (prev == null || prev != variant) {
                 updateProperty(playerEntity, variant);
+                logger().info("[CampfireElytra] updateProperty -> " + variant + " for " + uuid);
             }
         }
 
-        // Xoá UUID không còn trong session
         cache.keySet().retainAll(seen);
     }
 
@@ -238,14 +238,17 @@ public class ElytraExtension implements Extension {
     /** Gọi playerEntity.updateProperty(elytraProperty, variant) */
     private void updateProperty(Object playerEntity, int variant) {
         try {
-            // updateProperty(GeyserEntityProperty, Object)
             for (Method m : playerEntity.getClass().getMethods()) {
                 if (m.getName().equals("updateProperty") && m.getParameterCount() == 2) {
                     m.invoke(playerEntity, elytraProperty, variant);
+                    logger().info("[CampfireElytra] updateProperty called successfully, method=" + m);
                     return;
                 }
             }
-        } catch (Exception ignored) {}
+            logger().warning("[CampfireElytra] updateProperty method NOT FOUND on " + playerEntity.getClass().getName());
+        } catch (Exception e) {
+            logger().warning("[CampfireElytra] updateProperty failed: " + e);
+        }
     }
 
     /** Lấy tất cả PlayerEntity trong session: bản thân + entity cache */
