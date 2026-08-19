@@ -10,7 +10,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -30,9 +29,16 @@ jobs:
       - name: Build
         run: ./gradlew shadowJar
 
-      - name: Upload artifact
+      - name: Upload Spigot plugin
         uses: actions/upload-artifact@v4
         with:
-          name: CampfireElytra
-          path: build/libs/ElytraPlugin-*.jar
+          name: ElytraSpigot
+          path: spigot/build/libs/ElytraSpigot-*.jar
+          if-no-files-found: error
+
+      - name: Upload Geyser extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: ElytraGeyser
+          path: geyser/build/libs/ElytraGeyser-*.jar
           if-no-files-found: error

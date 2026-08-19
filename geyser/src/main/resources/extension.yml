@@ -1,0 +1,6 @@
+id: campfire-elytra
+name: CampfireElytraGeyser
+version: 1.0.0
+api: 2.10.0
+authors: [ campfire ]
+main: com.campfire.elytra.geyser.ElytraGeyserExtension
