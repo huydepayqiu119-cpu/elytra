@@ -167,6 +167,10 @@ public class ElytraExtension implements Extension {
             }
 
             if (itemStack == null) return null;
+
+            // Log để debug
+            logger().info("[CampfireElytra] itemStack=" + itemStack.getClass().getName());
+
             return getItemModel(itemStack);
         } catch (Exception e) {
             return null;
@@ -196,25 +200,26 @@ public class ElytraExtension implements Extension {
 
         // Fallback: CustomModelData NBT (legacy mapping type)
         try {
-            // getCustomModelData() hoặc getMapping().getCustomModelData()
             for (String m : new String[]{"getCustomModelData", "customModelData"}) {
                 try {
                     Object v = itemStack.getClass().getMethod(m).invoke(itemStack);
+                    logger().info("[CampfireElytra] " + m + "=" + v);
                     if (v instanceof Number n && n.intValue() != 0) {
-                        // Tra ngược từ customModelData → item_model id
                         return customModelDataToModel(n.intValue());
                     }
                 } catch (NoSuchMethodException ignored) {}
             }
-            // Thử qua mapping
             Object mapping = itemStack.getClass().getMethod("getMapping").invoke(itemStack);
             if (mapping != null) {
                 Object cmd = mapping.getClass().getMethod("getCustomModelData").invoke(mapping);
+                logger().info("[CampfireElytra] mapping.customModelData=" + cmd);
                 if (cmd instanceof Number n && n.intValue() != 0) {
                     return customModelDataToModel(n.intValue());
                 }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            logger().warning("[CampfireElytra] CMD fallback failed: " + e);
+        }
         return null;
     }
 
