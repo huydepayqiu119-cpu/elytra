@@ -30,16 +30,13 @@ public class ElytraExtension implements Extension {
     private static final String PROPERTY_NAME      = "elytra";
     private static final int    MAX_VARIANTS       = 255;
 
-    // Map từ item_model id → variant index
+    // Map từ equippable.model id (Nexo/Oraxen) → variant index
     // index 0 = vanilla elytra (không custom)
     private static final Map<String, Integer> VARIANTS = new LinkedHashMap<>();
     static {
-        VARIANTS.put("campfire:elytra_red",    1);
-        VARIANTS.put("campfire:elytra_blue",   2);
-        VARIANTS.put("campfire:elytra_gold",   3);
-        VARIANTS.put("campfire:custom_elytra", 4);
-        VARIANTS.put("campfire:elytra",        4);
-        // Thêm variants tại đây
+        VARIANTS.put("nexo:forest_elytra", 1);
+        // Thêm elytra khác tại đây, ví dụ:
+        // VARIANTS.put("nexo:fire_elytra", 2);
     }
 
     // GeyserEntityProperty handle (set khi register)
@@ -177,59 +174,59 @@ public class ElytraExtension implements Extension {
         }
     }
 
-    /** Đọc item_model component từ GeyserItemStack qua reflection lazy */
+    /** Đọc model id từ GeyserItemStack — ưu tiên equippable.model, fallback item_model */
     private String getItemModel(Object itemStack) {
-        // Thử item_model component trước (Java 1.21+)
-        if (componentApiAvailable) {
-            try {
-                if (getComponentMethod == null || itemModelType == null) {
-                    Class<?> dcTypes = Class.forName(
-                        "org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes");
-                    itemModelType = dcTypes.getField("ITEM_MODEL").get(null);
-                    Class<?> dcType = Class.forName(
-                        "org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentType");
-                    getComponentMethod = itemStack.getClass().getMethod("getComponent", dcType);
-                }
-                Object result = getComponentMethod.invoke(itemStack, itemModelType);
-                logger().info("[CampfireElytra] item_model=" + result);
-                if (result != null && !result.toString().equals("minecraft:elytra")) return result.toString();
-            } catch (Exception e) {
-                componentApiAvailable = false;
-                logger().warning("[CampfireElytra] item_model component unavailable, falling back to CustomModelData: " + e.getMessage());
-            }
-        }
-
-        // Fallback: dump tất cả components để tìm CustomModelData
+        // 1. Thử equippable component → model field (chính xác nhất với Nexo elytra)
         try {
-            Object allComponents = itemStack.getClass().getMethod("getAllComponents").invoke(itemStack);
-            logger().info("[CampfireElytra] getAllComponents=" + allComponents);
-            if (allComponents instanceof Map<?,?> map) {
-                for (Map.Entry<?,?> e : map.entrySet()) {
-                    logger().info("[CampfireElytra]   component: " + e.getKey() + " = " + e.getValue());
+            if (getComponentMethod == null || itemModelType == null) {
+                Class<?> dcTypes = Class.forName(
+                    "org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes");
+                itemModelType = dcTypes.getField("ITEM_MODEL").get(null);
+                Class<?> dcType = Class.forName(
+                    "org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentType");
+                getComponentMethod = itemStack.getClass().getMethod("getComponent", dcType);
+            }
+
+            // Lấy EQUIPPABLE component
+            Class<?> dcTypes = Class.forName(
+                "org.geysermc.mcprotocollib.protocol.data.game.item.component.DataComponentTypes");
+            Object equippableType = dcTypes.getField("EQUIPPABLE").get(null);
+            Object equippable = getComponentMethod.invoke(itemStack, equippableType);
+            if (equippable != null) {
+                // equippable.model() hoặc getModel()
+                for (String m : new String[]{"model", "getModel"}) {
+                    try {
+                        Object model = equippable.getClass().getMethod(m).invoke(equippable);
+                        if (model != null && !model.toString().isEmpty()
+                                && !model.toString().equals("minecraft:elytra")) {
+                            logger().info("[CampfireElytra] equippable.model=" + model);
+                            return model.toString();
+                        }
+                    } catch (NoSuchMethodException ignored) {}
                 }
             }
         } catch (Exception e) {
-            logger().warning("[CampfireElytra] getAllComponents failed: " + e);
+            logger().warning("[CampfireElytra] equippable read failed: " + e);
         }
+
+        // 2. Fallback: item_model component (nếu khác vanilla)
+        if (componentApiAvailable) {
+            try {
+                Object result = getComponentMethod.invoke(itemStack, itemModelType);
+                if (result != null && !result.toString().equals("minecraft:elytra")) {
+                    return result.toString();
+                }
+            } catch (Exception e) {
+                componentApiAvailable = false;
+            }
+        }
+
         return null;
     }
-
-    /** Map CustomModelData int → item_model string (khớp với Geyser mapping JSON) */
-    private String customModelDataToModel(int cmd) {
-        // Tra ngược VARIANTS map hoặc dùng hardcode theo mapping file
-        for (Map.Entry<String, Integer> e : VARIANTS.entrySet()) {
-            // Nếu variant index khớp với cmd (legacy mapping dùng cmd làm variant)
-        }
-        // Fallback: dùng map riêng cho CustomModelData
-        return CMD_MAP.get(cmd);
     }
 
-    // Map CustomModelData → item_model id (theo file mapping JSON của bạn)
-    private static final Map<Integer, String> CMD_MAP = new HashMap<>();
-    static {
-        CMD_MAP.put(1000, "campfire:custom_elytra");
-        // Thêm các CMD khác tại đây nếu có
-    }
+    /** Map CustomModelData int → item_model string (không còn dùng) */
+    private String customModelDataToModel(int cmd) { return null; }
 
     /** Gọi playerEntity.updateProperty(elytraProperty, variant) */
     private void updateProperty(Object playerEntity, int variant) {
