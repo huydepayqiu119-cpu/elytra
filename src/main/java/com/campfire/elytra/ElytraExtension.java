@@ -223,7 +223,6 @@ public class ElytraExtension implements Extension {
 
         return null;
     }
-    }
 
     /** Map CustomModelData int → item_model string (không còn dùng) */
     private String customModelDataToModel(int cmd) { return null; }
